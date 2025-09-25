@@ -45,6 +45,7 @@ afk_collection = db.afk
 users_collection = db.users  # For user stats
 groups_collection = db.groups  # For tracking groups
 broadcast_collection = db.broadcast_tmp  # For temporary broadcast data
+auto_delete_collection = db.auto_delete  # For auto-delete settings and messages
 
 # Helper functions
 def get_readable_time(seconds: int) -> str:
@@ -114,6 +115,160 @@ async def get_all_groups():
         groups.append(group)
     return groups
 
+# =======================================================================
+# Auto-delete feature implementation (Per Group Settings)
+# =======================================================================
+async def init_group_auto_delete_settings(chat_id: int):
+    """Initialize auto-delete settings for a group with default values"""
+    settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    if not settings:
+        await auto_delete_collection.insert_one({
+            "type": "group_settings",
+            "chat_id": chat_id,
+            "enabled": False,
+            "delete_after": 300  # 5 minutes in seconds (default)
+        })
+        logger.info(f"Initialized auto-delete settings for group {chat_id}")
+
+async def is_auto_delete_enabled(chat_id: int):
+    """Check if auto-delete is enabled for a group"""
+    settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    if settings:
+        return settings.get("enabled", False)
+    return False
+
+async def get_auto_delete_time(chat_id: int):
+    """Get auto-delete time in seconds for a group"""
+    settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    if settings:
+        return settings.get("delete_after", 300)  # 5 minutes default
+    return 300
+
+async def toggle_auto_delete(chat_id: int, state: bool = None):
+    """Toggle auto-delete status for a group"""
+    settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    if not settings:
+        await init_group_auto_delete_settings(chat_id)
+        settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    
+    if state is None:
+        new_state = not settings["enabled"]
+    else:
+        new_state = state
+        
+    await auto_delete_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"enabled": new_state}}
+    )
+    logger.info(f"Auto-delete toggled to {new_state} for group {chat_id}")
+    return new_state
+
+async def set_auto_delete_time(chat_id: int, seconds: int):
+    """Set auto-delete time in seconds for a group"""
+    await auto_delete_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"delete_after": seconds}},
+        upsert=True
+    )
+    minutes = seconds // 60
+    logger.info(f"Auto-delete time set to {minutes} minutes for group {chat_id}")
+    return seconds
+
+async def track_message_for_deletion(message: Message):
+    """Track a message for future deletion based on group settings"""
+    if not message.chat or message.chat.type not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        return
+        
+    chat_id = message.chat.id
+    
+    if not await is_auto_delete_enabled(chat_id):
+        return
+        
+    delete_after = await get_auto_delete_time(chat_id)
+    delete_at = time.time() + delete_after
+    
+    await auto_delete_collection.insert_one({
+        "type": "message",
+        "message_id": message.id,
+        "chat_id": chat_id,
+        "delete_at": delete_at
+    })
+    logger.debug(f"Tracking message for deletion: {message.id} in chat {chat_id}")
+
+async def auto_delete_loop():
+    """Background task to delete expired messages"""
+    logger.info("Auto-delete task started")
+    while True:
+        try:
+            # Process messages due for deletion
+            current_time = time.time()
+            query = {"type": "message", "delete_at": {"$lte": current_time}}
+            messages_to_delete = await auto_delete_collection.find(query).to_list(None)
+            
+            if messages_to_delete:
+                logger.info(f"Found {len(messages_to_delete)} messages to delete")
+                
+            for msg in messages_to_delete:
+                try:
+                    await app.delete_messages(msg["chat_id"], msg["message_id"])
+                    logger.debug(f"Deleted message: {msg['message_id']} in chat {msg['chat_id']}")
+                except Exception as e:
+                    logger.error(f"Failed to delete message: {e}")
+                finally:
+                    # Remove from tracking regardless of success
+                    await auto_delete_collection.delete_one({"_id": msg["_id"]})
+            
+            # Sleep before next check
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Error in auto-delete loop: {e}")
+            await asyncio.sleep(60)
+
+# Helper function to generate auto-delete menu for a group
+async def get_auto_delete_menu(chat_id: int):
+    settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    if not settings:
+        await init_group_auto_delete_settings(chat_id)
+        settings = await auto_delete_collection.find_one({"chat_id": chat_id})
+    
+    enabled = settings["enabled"]
+    delete_after = settings["delete_after"]
+    minutes = delete_after // 60
+    
+    status = "🟢 Enabled" if enabled else "🔴 Disabled"
+    
+    text = (
+        f"🤖 **Auto-Delete Settings for This Group**\n\n"
+        f"• Status: {status}\n"
+        f"• Delete after: `{minutes} minutes`\n\n"
+        "**Set Time (minutes):**"
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🟢 Enable", callback_data=f"autodel_enable:{chat_id}"),
+            InlineKeyboardButton("🔴 Disable", callback_data=f"autodel_disable:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("5 min", callback_data=f"autodel_time:300:{chat_id}"),
+            InlineKeyboardButton("10 min", callback_data=f"autodel_time:600:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("30 min", callback_data=f"autodel_time:1800:{chat_id}"),
+            InlineKeyboardButton("60 min", callback_data=f"autodel_time:3600:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Main", callback_data="back_to_start"),
+            InlineKeyboardButton("❌ Close", callback_data=f"autodel_close:{chat_id}")
+        ]
+    ])
+    
+    return text, keyboard
+
+# =======================================================================
+# End of auto-delete feature
+# =======================================================================
+
 # Create Flask server for health checks
 flask_app = Flask(__name__)
 
@@ -170,6 +325,8 @@ async def new_chat_members(_, message: Message):
                     message.chat.title
                 )
                 logger.info(f"Bot added to group: {message.chat.title} ({message.chat.id})")
+                # Initialize auto-delete settings for this new group
+                await init_group_auto_delete_settings(message.chat.id)
 
 # Start command handler with new image and message
 @app.on_message(filters.command(["start", "help"]))
@@ -183,6 +340,8 @@ async def start_command(_, message: Message):
             message.chat.id,
             message.chat.title
         )
+        # Initialize auto-delete settings if not exists
+        await init_group_auto_delete_settings(message.chat.id)
     
     # Add user to database for stats
     if user:
@@ -215,11 +374,12 @@ Use /help for more info.
 """
     
     # Send photo with caption and buttons
-    await message.reply_photo(
+    sent_msg = await message.reply_photo(
         photo="https://i.ibb.co/kVYPDqRC/tmp5h-atl08.jpg",
         caption=text,
         reply_markup=keyboard
     )
+    await track_message_for_deletion(sent_msg)
 
 # Help callback handler
 @app.on_callback_query(filters.regex("^help$"))
@@ -244,6 +404,7 @@ async def help_callback(_, query):
 
 **Other Commands:**
 - /stats - Show bot statistics
+- /autodel - Configure auto-delete settings for this group (Admins only)
 """
     
     await query.message.edit_text(
@@ -310,6 +471,8 @@ async def afk_handler(_, message: Message):
             message.chat.id,
             message.chat.title
         )
+        # Initialize auto-delete settings if not exists
+        await init_group_auto_delete_settings(message.chat.id)
     
     # Add user to database for stats
     await add_user(user_id)
@@ -337,26 +500,28 @@ async def afk_handler(_, message: Message):
                 base_text += f"\n\nReason: `{reasonafk}`"
             
             if afktype == "animation":
-                await message.reply_animation(
+                sent_msg = await message.reply_animation(
                     data,
                     caption=base_text,
                 )
             elif afktype == "photo":
-                await message.reply_photo(
+                sent_msg = await message.reply_photo(
                     photo=f"downloads/{user_id}.jpg",
                     caption=base_text,
                 )
             else:
-                await message.reply_text(
+                sent_msg = await message.reply_text(
                     base_text,
                     disable_web_page_preview=True,
                 )
+            await track_message_for_deletion(sent_msg)
         except Exception as e:
             logger.error(f"Error in AFK return: {e}")
-            await message.reply_text(
+            sent_msg = await message.reply_text(
                 f"**{message.from_user.first_name}** is back online",
                 disable_web_page_preview=True,
             )
+            await track_message_for_deletion(sent_msg)
         return
 
     # Setting new AFK status
@@ -430,7 +595,8 @@ async def afk_handler(_, message: Message):
     response = f"**{message.from_user.first_name}** is now AFK"
     if details["reason"]:
         response += f"\n\nReason: `{details['reason']}`"
-    await message.reply_text(response)
+    sent_msg = await message.reply_text(response)
+    await track_message_for_deletion(sent_msg)
 
 # AFK watcher
 @app.on_message(
@@ -449,6 +615,8 @@ async def afk_watcher(_, message: Message):
         message.chat.id,
         message.chat.title
     )
+    # Initialize auto-delete settings if not exists
+    await init_group_auto_delete_settings(message.chat.id)
     
     # Add user to database for stats
     await add_user(userid)
@@ -476,23 +644,25 @@ async def afk_watcher(_, message: Message):
                 base_text += f"\n\nReason: `{reasonafk}`"
             
             if afktype == "animation":
-                await message.reply_animation(
+                sent_msg = await message.reply_animation(
                     data,
                     caption=base_text,
                 )
             elif afktype == "photo":
-                await message.reply_photo(
+                sent_msg = await message.reply_photo(
                     photo=f"downloads/{userid}.jpg",
                     caption=base_text,
                 )
             else:
-                await message.reply_text(
+                sent_msg = await message.reply_text(
                     base_text,
                     disable_web_page_preview=True,
                 )
+            await track_message_for_deletion(sent_msg)
         except Exception as e:
             logger.error(f"Error in AFK return watcher: {e}")
-            await message.reply_text(f"**{user_name}** is back online")
+            sent_msg = await message.reply_text(f"**{user_name}** is back online")
+            await track_message_for_deletion(sent_msg)
 
     # Check if replying to AFK user
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -513,14 +683,15 @@ async def afk_watcher(_, message: Message):
                     base_text += f"\n\nReason: `{reasonafk}`"
                 
                 if afktype == "animation":
-                    await message.reply_animation(data, caption=base_text)
+                    sent_msg = await message.reply_animation(data, caption=base_text)
                 elif afktype == "photo":
-                    await message.reply_photo(
+                    sent_msg = await message.reply_photo(
                         photo=f"downloads/{replied_user.id}.jpg",
                         caption=base_text
                     )
                 else:
-                    await message.reply_text(base_text)
+                    sent_msg = await message.reply_text(base_text)
+                await track_message_for_deletion(sent_msg)
         except Exception as e:
             logger.error(f"Error in AFK reply watcher: {e}")
 
@@ -557,14 +728,15 @@ async def afk_watcher(_, message: Message):
                             base_text += f"\n\nReason: `{reasonafk}`"
                         
                         if afktype == "animation":
-                            await message.reply_animation(data, caption=base_text)
+                            sent_msg = await message.reply_animation(data, caption=base_text)
                         elif afktype == "photo":
-                            await message.reply_photo(
+                            sent_msg = await message.reply_photo(
                                 photo=f"downloads/{user.id}.jpg",
                                 caption=base_text
                             )
                         else:
-                            await message.reply_text(base_text)
+                            sent_msg = await message.reply_text(base_text)
+                        await track_message_for_deletion(sent_msg)
                 except Exception as e:
                     logger.error(f"Error handling mention: {e}")
                     
@@ -588,14 +760,15 @@ async def afk_watcher(_, message: Message):
                             base_text += f"\n\nReason: `{reasonafk}`"
                         
                         if afktype == "animation":
-                            await message.reply_animation(data, caption=base_text)
+                            sent_msg = await message.reply_animation(data, caption=base_text)
                         elif afktype == "photo":
-                            await message.reply_photo(
+                            sent_msg = await message.reply_photo(
                                 photo=f"downloads/{user.id}.jpg",
                                 caption=base_text
                             )
                         else:
-                            await message.reply_text(base_text)
+                            sent_msg = await message.reply_text(base_text)
+                        await track_message_for_deletion(sent_msg)
                 except Exception as e:
                     logger.error(f"Error handling text mention: {e}")
 
@@ -614,21 +787,23 @@ async def broadcast_to_users(message, broadcast_type, text=None, replied_msg=Non
         try:
             if text:
                 # Send text message
-                await app.send_message(chat_id=user_id, text=text)
+                sent_msg = await app.send_message(chat_id=user_id, text=text)
+                await track_message_for_deletion(sent_msg)
             elif replied_msg:
                 # Handle replied message
                 if broadcast_type == "bcast":
-                    await app.copy_message(
+                    sent_msg = await app.copy_message(
                         chat_id=user_id,
                         from_chat_id=replied_msg.chat.id,
                         message_id=replied_msg.id
                     )
                 else:  # fcast
-                    await app.forward_messages(
+                    sent_msg = await app.forward_messages(
                         chat_id=user_id,
                         from_chat_id=replied_msg.chat.id,
                         message_ids=replied_msg.id
                     )
+                await track_message_for_deletion(sent_msg)
             success += 1
         except Exception as e:
             failed += 1
@@ -690,6 +865,10 @@ async def broadcast_to_groups(message, broadcast_type, text=None, replied_msg=No
                     logger.warning(f"Bot lacks permission to pin in group {group['chat_id']}")
                 except Exception as e:
                     logger.error(f"Pin message failed in group {group['chat_id']}: {e}")
+            
+            # Track message for deletion if applicable
+            if sent_msg:
+                await track_message_for_deletion(sent_msg)
             
             success += 1
         except Exception as e:
@@ -765,10 +944,11 @@ async def broadcast_menu(_, message: Message):
     
     text += "Select options:"
     
-    await message.reply_text(
+    sent_msg = await message.reply_text(
         text,
         reply_markup=keyboard
     )
+    await track_message_for_deletion(sent_msg)
 
 # Callback handler for broadcast options
 @app.on_callback_query(filters.regex(r"^broadcast_option:(\w+):(\w+)$"))
@@ -857,6 +1037,7 @@ async def broadcast_confirm_handler(_, query: CallbackQuery):
                     chat_id=chat_id,
                     text=broadcast_data["text"]
                 )
+                await track_message_for_deletion(current_msg)
             elif broadcast_data.get("replied_msg_id"):
                 # Get the replied message object
                 replied_msg = await app.get_messages(
@@ -877,6 +1058,7 @@ async def broadcast_confirm_handler(_, query: CallbackQuery):
                         from_chat_id=replied_msg.chat.id,
                         message_ids=replied_msg.id
                     )
+                await track_message_for_deletion(current_msg)
         except Exception as e:
             logger.error(f"Current chat broadcast failed: {e}")
             await query.message.edit_text(f"❌ Failed to send in current chat: {e}")
@@ -1004,13 +1186,126 @@ async def stats_command(_, message: Message):
         f"• Groups Added: `{total_groups}`"
     )
     
-    await message.reply_text(stats_text)
+    sent_msg = await message.reply_text(stats_text)
+    await track_message_for_deletion(sent_msg)
+
+# Auto-delete menu command (inline buttons) - Per Group Settings
+@app.on_message(filters.command(["autodel", "autodelete"]) & filters.group)
+async def auto_delete_menu(_, message: Message):
+    """Show auto-delete settings menu for this group"""
+    chat_id = message.chat.id
+    await init_group_auto_delete_settings(chat_id)
+    
+    # Check if user is admin
+    try:
+        member = await app.get_chat_member(chat_id, message.from_user.id)
+        if member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+            await message.reply_text("❌ You must be an admin to configure auto-delete settings")
+            return
+    except Exception as e:
+        logger.error(f"Admin check error: {e}")
+        await message.reply_text("❌ Failed to verify admin status")
+        return
+    
+    text, keyboard = await get_auto_delete_menu(chat_id)
+    
+    sent_msg = await message.reply_text(text, reply_markup=keyboard)
+    await track_message_for_deletion(sent_msg)
+
+# Auto-delete callback handler - FIXED VERSION
+@app.on_callback_query(filters.regex(r"^autodel_"))
+async def auto_delete_callback(_, query: CallbackQuery):
+    """Handle auto-delete callback actions with group-specific settings"""
+    try:
+        # Extract action and chat ID from callback data
+        data = query.data
+        if data.startswith("autodel_time:"):
+            # Format: "autodel_time:seconds:chat_id"
+            parts = data.split(':')
+            seconds = int(parts[1])
+            chat_id = int(parts[2])
+            action = "time"
+        else:
+            # Format: "autodel_action:chat_id"
+            parts = data.split(':')
+            action = parts[0].replace("autodel_", "")
+            chat_id = int(parts[1])
+        
+        # Check if user is admin in this group
+        try:
+            member = await app.get_chat_member(chat_id, query.from_user.id)
+            if member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+                await query.answer("❌ You must be an admin to use this", show_alert=True)
+                return
+        except Exception as e:
+            logger.error(f"Admin check error: {e}")
+            await query.answer("❌ Permission check failed", show_alert=True)
+            return
+
+        await query.answer()
+        
+        if action == "enable":
+            await toggle_auto_delete(chat_id, True)
+            current_time = await get_auto_delete_time(chat_id)
+            minutes = current_time // 60
+            
+            text = (
+                "✅ Auto-delete has been enabled for this group\n\n"
+                f"• Current delete time: `{minutes} minutes`\n\n"
+                "Use the buttons below to manage settings:"
+            )
+            
+            await query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Menu", callback_data=f"autodel_back:{chat_id}")],
+                    [InlineKeyboardButton("❌ Close", callback_data=f"autodel_close:{chat_id}")]
+                ])
+            )
+        
+        elif action == "disable":
+            await toggle_auto_delete(chat_id, False)
+            await query.message.edit_text(
+                "❌ Auto-delete has been disabled for this group\n\n"
+                "Bot messages in this group will no longer be automatically deleted.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Menu", callback_data=f"autodel_back:{chat_id}")],
+                    [InlineKeyboardButton("❌ Close", callback_data=f"autodel_close:{chat_id}")]
+                ])
+            )
+        
+        elif action == "time":
+            minutes = seconds // 60
+            await set_auto_delete_time(chat_id, seconds)
+            await toggle_auto_delete(chat_id, True)
+            await query.message.edit_text(
+                f"✅ Auto-delete time set to {minutes} minutes and enabled for this group",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Menu", callback_data=f"autodel_back:{chat_id}")],
+                    [InlineKeyboardButton("❌ Close", callback_data=f"autodel_close:{chat_id}")]
+                ])
+            )
+        
+        elif action == "close":
+            await query.message.delete()
+        
+        elif action == "back":
+            # Re-show the menu for this group
+            text, keyboard = await get_auto_delete_menu(chat_id)
+            await query.message.edit_text(text, reply_markup=keyboard)
+    
+    except Exception as e:
+        logger.error(f"Error in auto-delete callback: {e}")
+        await query.answer("An error occurred. Please try again.", show_alert=True)
 
 # Main execution
 async def main():
     # Create downloads directory if not exists
     os.makedirs("downloads", exist_ok=True)
     logger.info("Created downloads directory")
+    
+    # Start auto-delete background task
+    asyncio.create_task(auto_delete_loop())
     
     # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
